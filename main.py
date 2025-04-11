@@ -62,7 +62,7 @@ def is_admin():
     try:
         admin = ctypes.windll.shell32.IsUserAnAdmin()
         if admin:
-            logger.info("管理员权限验证成功 👮♂️")
+            logger.info("管理员权限验证成功 👮")
         return admin
     except Exception as e:
         logger.error(f"权限检查失败: {e} 🚫")
