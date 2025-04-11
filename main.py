@@ -12,6 +12,16 @@ from colorama import init, Fore, Back, Style
 # 初始化colorama
 init(autoreset=True)
 
+# ================= 系统状态检测API =================
+user32 = ctypes.WinDLL('user32', use_last_error=True)
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [
+        ('cbSize', ctypes.wintypes.UINT),
+        ('dwTime', ctypes.wintypes.DWORD),
+    ]
+
 # ================= 日志配置 =================
 LOG_FILE = "qq_monitor.log"
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
@@ -41,7 +51,7 @@ class EmojiFormatter(logging.Formatter):
 
 # 初始化日志系统
 logger = logging.getLogger('QQMonitor')
-logger.setLevel(logging.DEBUG)  # 启用DEBUG级别
+logger.setLevel(logging.INFO)
 
 # 文件日志处理器
 file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
@@ -55,6 +65,55 @@ console_handler.setFormatter(console_formatter)
 
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+
+# ================= 智能日志管理 =================
+class SmartLogger:
+    def __init__(self):
+        self.last_window_state = None
+        self.last_log_time = 0
+        self.log_interval = 300  # 5分钟记录一次持续状态
+
+    def log_window_state(self, has_window):
+        current_time = time.time()
+        if has_window != self.last_window_state:
+            if has_window:
+                logger.debug("前台窗口恢复 👀")
+            else:
+                logger.debug("检测到无有效前台窗口 🔍")
+            self.last_window_state = has_window
+            self.last_log_time = current_time
+        elif not has_window and (current_time - self.last_log_time) > self.log_interval:
+            logger.debug(f"持续无有效前台窗口已 {self.log_interval}秒 ⏳")
+            self.last_log_time = current_time
+
+smart_logger = SmartLogger()
+
+# ================= 系统状态检测 =================
+def get_idle_duration():
+    """获取系统空闲时间（毫秒）"""
+    last_input_info = LASTINPUTINFO()
+    last_input_info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+    if user32.GetLastInputInfo(ctypes.byref(last_input_info)):
+        return kernel32.GetTickCount() - last_input_info.dwTime
+    return 0
+
+def is_workstation_locked():
+    """检测系统是否处于锁定状态"""
+    try:
+        hdesk = user32.OpenDesktopW("Default", 0, False, 0x0100)
+        if hdesk == 0:
+            return True
+        user32.CloseDesktop(hdesk)
+        return False
+    except:
+        return False
+
+def is_remote_session():
+    """检测是否在远程会话中"""
+    try:
+        return ctypes.windll.kernel32.GetSystemMetrics(0x1000) != 0  # SM_REMOTESESSION
+    except:
+        return os.getenv('SESSIONNAME', '').startswith('RDP-')
 
 # ================= 系统函数 =================
 def is_admin():
@@ -80,31 +139,39 @@ def elevate_privileges():
 
 # ================= 进程管理 =================
 def get_foreground_pid():
-    """获取前台进程ID（增强验证版）"""
+    """增强版前台进程检测"""
     try:
-        hwnd = win32gui.GetForegroundWindow()
-        
-        # 验证窗口句柄有效性
-        if hwnd == 0:
-            logger.debug("无有效前台窗口")
+        # 排除非活动系统状态
+        if is_remote_session():
             return None
             
-        # 获取进程ID
+        if is_workstation_locked():
+            return None
+            
+        if get_idle_duration() > 300000:  # 5分钟无操作视为可能锁定
+            return None
+
+        hwnd = win32gui.GetForegroundWindow()
+        has_window = hwnd != 0
+        
+        # 智能日志记录
+        smart_logger.log_window_state(has_window)
+        
+        if not has_window:
+            return None
+            
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         
         # PID有效性验证
         if not isinstance(pid, int) or pid <= 0:
-            logger.warning(f"无效的进程ID: {pid}")
             return None
             
-        # 验证进程是否存在
         if not psutil.pid_exists(pid):
-            logger.debug(f"进程不存在: PID={pid}")
             return None
             
         return pid
     except Exception as e:
-        logger.error(f"获取前台窗口失败: {e} 🖥️")
+        logger.error(f"窗口检测异常: {str(e)[:50]} ⚠️")
         return None
 
 def kill_process(proc_name):
@@ -115,7 +182,6 @@ def kill_process(proc_name):
         try:
             if proc.info['name'].lower() == proc_name.lower():
                 p = psutil.Process(proc.info['pid'])
-                # 检查进程状态
                 if p.status() == psutil.STATUS_ZOMBIE:
                     logger.warning(f"忽略僵尸进程: {proc_name} (PID: {p.pid})")
                     continue
@@ -146,7 +212,7 @@ def start_qq():
 
 # ================= 主逻辑 =================
 def main_loop():
-    """增强型监控循环"""
+    """智能监控循环"""
     last_trigger = 0
     cooldown = 60
     error_count = 0
@@ -156,15 +222,17 @@ def main_loop():
     while True:
         try:
             fg_pid = get_foreground_pid()
-            if not fg_pid:
-                time.sleep(1)  # 无有效PID时快速重试
+            
+            # 动态调整检测间隔
+            if fg_pid is None:
+                sleep_time = 30 if smart_logger.last_window_state is False else 5
+                time.sleep(sleep_time)
                 continue
 
             try:
                 proc = psutil.Process(fg_pid)
                 proc_name = proc.name()
                 
-                # 检查进程状态
                 if proc.status() == psutil.STATUS_ZOMBIE:
                     logger.warning(f"检测到僵尸进程: {proc_name}")
                     continue
@@ -174,11 +242,9 @@ def main_loop():
                     if current_time - last_trigger > cooldown:
                         logger.warning("检测到crashpad_handler进入前台! 🔍")
                         
-                        # 终止进程
                         killed_crashpad = kill_process('crashpad_handler.exe')
                         killed_qq = kill_process('qq.exe')
                         
-                        # 启动QQ
                         if start_qq():
                             logger.success(f"操作完成: 终止{killed_crashpad}个crashpad进程和{killed_qq}个QQ进程 🔄")
                         else:
@@ -186,12 +252,13 @@ def main_loop():
                         
                         last_trigger = current_time
                     else:
-                        logger.info(f"冷却时间剩余: {cooldown - int(current_time - last_trigger)}秒 ⏳")
+                        remain = cooldown - int(current_time - last_trigger)
+                        logger.info(f"冷却时间剩余: {remain}秒 ⏳")
             
             except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
                 logger.warning(f"进程状态异常: {e} ⚠️")
             
-            error_count = 0  # 重置错误计数
+            error_count = 0
             time.sleep(5)
             
         except Exception as e:
