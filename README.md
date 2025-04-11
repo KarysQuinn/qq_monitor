@@ -34,4 +34,4 @@
 ### 快速开始
 1. 安装依赖库：
 ```bash
-pip install psutil pywin32
+pip install psutil pywin32 colorama
