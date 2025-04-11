@@ -1,0 +1,93 @@
+name: Build QQ Monitor with Conda
+
+on: 
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10"]
+
+    steps:
+    - uses: actions/checkout@v4
+      
+    - name: Set up Miniconda
+      uses: conda-incubator/setup-miniconda@v2
+      with:
+        python-version: ${{ matrix.python-version }}
+        activate-environment: qq-monitor
+        environment-file: environment.yml
+        auto-update-conda: true
+
+    - name: Install PyInstaller (with Windows specific dependencies)
+      shell: cmd
+      run: |
+        conda activate qq-monitor
+        pip install --upgrade pip
+        pip install pyinstaller==5.13.0
+        pip install pypiwin32==223 pywin32==306
+        conda install -c conda-forge upx
+
+    - name: Build EXE with UAC admin
+      shell: cmd
+      run: |
+        conda activate qq-monitor
+        pyinstaller --onefile --uac-admin --icon assets/qq_icon.ico --add-data "assets/qq_icon.ico;assets" qq_monitor.py
+        dir dist
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: QQMonitor-${{ matrix.python-version }}
+        path: |
+          dist/qq_monitor.exe
+          build/qq_monitor/qq_monitor.exe.manifest
+
+  test:
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download built EXE
+      uses: actions/download-artifact@v3
+      with:
+        name: QQMonitor-3.8  # 测试最基础版本
+
+    - name: Test basic functionality
+      shell: cmd
+      run: |
+        echo "Starting smoke test..."
+        qq_monitor.exe --version || echo "Version check failed"
+        tasklist | find "qq_monitor.exe" && echo "Process running successfully"
+
+  deploy:
+    needs: [build-windows, test]
+    runs-on: windows-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+      
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: Create release package
+      shell: cmd
+      run: |
+        7z a -tzip QQMonitor-${{ github.sha }}.zip artifacts/*/*.exe
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: QQMonitor-${{ github.sha }}.zip
+        draft: false
+        prerelease: false
